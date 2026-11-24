@@ -1,0 +1,60 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="CsgoWorkshop.App.MainWindow"
+        Title="CS:GO Workshop: загрузка карты"
+        Width="500" Height="380"
+        MinWidth="440" MinHeight="330"
+        WindowStartupLocation="CenterScreen">
+
+  <DockPanel Margin="10,8,10,6">
+
+    <StackPanel DockPanel.Dock="Bottom" Margin="0,6,0,0" Orientation="Horizontal" Spacing="3">
+      <TextBlock VerticalAlignment="Center" Foreground="#666666" Text="Created by" />
+      <Button x:Name="AuthorLink" Classes="link" VerticalAlignment="Center"
+              ToolTip.Tip="https://sociald.fastapicloud.dev/SolidLink">
+        <TextBlock TextDecorations="Underline" Text="SolidLink" />
+      </Button>
+    </StackPanel>
+
+    <Grid RowSpacing="6" RowDefinitions="Auto,Auto,Auto,Auto,Auto,*">
+
+      <Grid Grid.Row="0" ColumnSpacing="6" RowSpacing="6" ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto">
+        <TextBlock VerticalAlignment="Center" Text="Ссылка или ID" />
+        <TextBox Grid.Column="1" Grid.ColumnSpan="2" x:Name="ItemBox"
+                 Watermark="…/sharedfiles/filedetails/?id=213240871" />
+
+        <TextBlock Grid.Row="1" VerticalAlignment="Center" Text="Папка maps" />
+        <TextBox Grid.Row="1" Grid.Column="1" x:Name="MapsBox"
+                 Watermark="…/steamapps/common/csgo legacy/csgo/maps" />
+        <Button Grid.Row="1" Grid.Column="2" x:Name="BrowseButton" Content="Обзор…" />
+      </Grid>
+
+      <Grid Grid.Row="1" Margin="0,2,0,0" ColumnSpacing="6" ColumnDefinitions="Auto,Auto,*,Auto">
+        <Button x:Name="StartButton" Classes="accent" IsDefault="True" Content="Скачать и установить" />
+        <Button Grid.Column="1" x:Name="CancelButton" IsEnabled="False" Content="Отмена" />
+        <Button Grid.Column="3" x:Name="LibraryButton" Content="Скачанные карты…" />
+      </Grid>
+
+      <ProgressBar Grid.Row="2" x:Name="Progress" Height="4" MinHeight="4" Minimum="0" Maximum="100" Value="0" />
+
+      <StackPanel Grid.Row="3" Spacing="4">
+        <TextBlock x:Name="StatusText" TextWrapping="Wrap" IsVisible="False" />
+        <TextBlock x:Name="DetailText" TextWrapping="Wrap" IsVisible="False" />
+        <Grid x:Name="ResultPanel" IsVisible="False" ColumnSpacing="6" ColumnDefinitions="Auto,*,Auto">
+          <TextBlock VerticalAlignment="Center" Text="Команда" />
+          <TextBox Grid.Column="1" x:Name="CommandBox" IsReadOnly="True"
+                   FontFamily="Cascadia Mono,Consolas,DejaVu Sans Mono,Liberation Mono,monospace" />
+          <Button Grid.Column="2" x:Name="CopyButton" Content="Копировать" />
+        </Grid>
+      </StackPanel>
+
+      <TextBlock Grid.Row="4" FontSize="11" Foreground="#666666" Text="Журнал" />
+      <Border Grid.Row="5" BorderThickness="1" BorderBrush="#BDBDBD" Background="White">
+        <ScrollViewer x:Name="LogScroll" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+          <SelectableTextBlock x:Name="LogText" Margin="5,3" TextWrapping="Wrap" FontSize="11"
+                               FontFamily="Cascadia Mono,Consolas,DejaVu Sans Mono,Liberation Mono,monospace" />
+        </ScrollViewer>
+      </Border>
+    </Grid>
+  </DockPanel>
+</Window>
