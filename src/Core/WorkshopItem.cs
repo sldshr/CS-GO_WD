@@ -10,6 +10,9 @@ public static partial class WorkshopItem
     [GeneratedRegex(@"(?:CommunityFilePage|filedetails|publishedfileid)[/=](\d{1,20})(?!\d)", RegexOptions.IgnoreCase)]
     private static partial Regex PathId();
 
+    [GeneratedRegex(@"(?:^|[/\\\s])workshop[/\\](\d{1,20})(?=[/\\\s]|$)", RegexOptions.IgnoreCase)]
+    private static partial Regex ConsoleWorkshopPathId();
+
     public static bool TryParseId(string? input, out ulong id)
     {
         id = 0;
@@ -23,6 +26,8 @@ public static partial class WorkshopItem
         var match = QueryId().Match(text);
         if (!match.Success)
             match = PathId().Match(text);
+        if (!match.Success)
+            match = ConsoleWorkshopPathId().Match(text);
 
         return match.Success && ulong.TryParse(match.Groups[1].Value, out id) && id != 0;
     }

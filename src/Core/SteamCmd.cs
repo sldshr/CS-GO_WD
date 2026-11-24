@@ -20,6 +20,7 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
     private const int GameAppId = 730;
     private const int PrimeAttempts = 3;
     private const int DownloadAttempts = 3;
+    private const int MaxTitleDisplayLength = 38;
 
     private static readonly string[] WindowsUrls =
     [
@@ -36,6 +37,11 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
     private static readonly HashSet<string> TransientReasons = new(StringComparer.OrdinalIgnoreCase)
     {
         "Timeout", "No Connection", "Failure", "Busy", "Service Unavailable", "Try Another CM", "Remote Disconnect",
+    };
+
+    private static readonly HashSet<string> MetadataExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".vdf", ".acf", ".patch", ".manifest", ".tmp",
     };
 
     public static SteamCmd Default() => new(AppPaths.SteamCmdDir, AppPaths.SteamHomeDir, AppPaths.ContentDir);
@@ -57,6 +63,7 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
 
         reporter.Log("steamcmd не найден, скачиваю с серверов Valve.");
         Directory.CreateDirectory(dir);
+        TryDelete(PrimedMarker);
 
         var archive = Path.Combine(Path.GetTempPath(), "csgo-workshop-steamcmd-" + Guid.NewGuid().ToString("N") + ".tmp");
         try
@@ -96,36 +103,105 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
         if (File.Exists(PrimedMarker))
             return;
 
-        const string status = "Первый запуск steamcmd: обновление, это может занять несколько минут…";
-        reporter.Log("Первый запуск: steamcmd обновляет себя (скачивает около 100 МБ), это происходит один раз.");
+        const string baseStatus = "Первый запуск steamcmd: обновление…";
+        reporter.Log("Первый запуск: steamcmd обновляет себя (около 100 МБ), это происходит один раз.");
 
+        SteamRun? lastRun = null;
         for (var attempt = 1; attempt <= PrimeAttempts; attempt++)
         {
-            reporter.Status(status, null);
-            var run = await RunAsync(["+quit"], status, reporter, ct);
-            ThrowIfCannotStart(run);
+            reporter.Status(baseStatus, null);
+            var currentText = baseStatus;
+            SteamUpdateBytes? latestBytes = null;
 
-            if (run.ExitCode == 0)
+            var run = await RunCoreAsync(
+                ["+quit"],
+                reporter.Log,
+                percent =>
+                {
+                    if (percent is { } p && latestBytes is { TotalBytes: > 0 } b)
+                    {
+                        reporter.Status(
+                            $"Первый запуск steamcmd: загрузка обновления ({Format.Size(b.DownloadedBytes)} из {Format.Size(b.TotalBytes)})",
+                            p);
+                    }
+                    else
+                    {
+                        reporter.Status(currentText, percent);
+                    }
+                },
+                stage =>
+                {
+                    currentText = stage switch
+                    {
+                        SteamStage.CheckingUpdates => "Первый запуск steamcmd: проверка обновлений…",
+                        SteamStage.DownloadingUpdate => "Первый запуск steamcmd: загрузка обновления…",
+                        SteamStage.ApplyingUpdate => "Первый запуск steamcmd: распаковка и установка обновления…",
+                        SteamStage.VerifyingInstallation => "Первый запуск steamcmd: проверка файлов…",
+                        SteamStage.LoadingApi => "Первый запуск steamcmd: инициализация Steam API…",
+                        _ => baseStatus,
+                    };
+                    if (stage != SteamStage.DownloadingUpdate)
+                        latestBytes = null;
+                    reporter.Status(currentText, null);
+                },
+                bytes => latestBytes = bytes,
+                monitorTaskFactory: null,
+                ct);
+
+            ThrowIfCannotStart(run);
+            lastRun = run;
+
+            if (run.ExitCode == 0 || (run.ExitCode == 7 && run.Transcript.Contains("Loading Steam API...OK", StringComparison.Ordinal)))
             {
-                File.WriteAllText(PrimedMarker, "");
+                TryWritePrimedMarker();
                 return;
             }
 
-            reporter.Log($"steamcmd завершился с кодом {run.ExitCode}, перезапуск ({attempt} из {PrimeAttempts}).");
+            if (attempt < PrimeAttempts)
+                reporter.Log($"steamcmd завершился с кодом {run.ExitCode}, перезапуск ({attempt} из {PrimeAttempts}).");
+        }
+
+        if (lastRun is not null)
+        {
+            throw new InstallException(
+                $"Не удалось обновить steamcmd при первом запуске (код {lastRun.ExitCode}). Проверьте подключение к интернету.\n" +
+                $"Последние строки вывода:\n{lastRun.Tail(6)}");
         }
     }
 
-    public async Task<string> DownloadItemAsync(ulong id, Reporter reporter, CancellationToken ct)
+    public Task<string> DownloadItemAsync(ulong id, Reporter reporter, CancellationToken ct, WorkshopItemInfo? metadata = null) =>
+        DownloadItemCoreAsync(id, metadata, reporter, ct);
+
+    private async Task<string> DownloadItemCoreAsync(ulong id, WorkshopItemInfo? metadata, Reporter reporter, CancellationToken ct)
     {
+        var label = FormatItemLabel(id, metadata?.Title);
+        var expectedBytes = metadata?.FileSize is > 0 ? metadata.FileSize : null;
+
         for (var attempt = 1; ; attempt++)
         {
             WipeWorkshopCache();
 
-            var status = $"Загрузка предмета {id} через steamcmd…";
-            reporter.Status(status, null);
+            var statusLock = new object();
+            var currentStage = SteamStage.Starting;
+            var currentStatus = $"Запуск steamcmd для загрузки {label}…";
+            var lastSentText = "";
+            double? lastSentPct = double.NaN;
+            SteamUpdateBytes? selfUpdateBytes = null;
+            var diskBytesObserved = false;
+
+            void EmitStatus(string text, double? pct)
+            {
+                if (text == lastSentText && Nullable.Equals(pct, lastSentPct))
+                    return;
+                lastSentText = text;
+                lastSentPct = pct;
+                reporter.Status(text, pct);
+            }
+
+            EmitStatus(currentStatus, null);
             reporter.Log($"steamcmd: workshop_download_item {GameAppId} {id} (попытка {attempt} из {DownloadAttempts})");
 
-            var run = await RunAsync(
+            var run = await RunCoreAsync(
                 [
                     "+@ShutdownOnFailedCommand", "1",
                     "+@NoPromptForPassword", "1",
@@ -134,12 +210,92 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
                     "+workshop_download_item", GameAppId.ToString(), id.ToString(),
                     "+quit",
                 ],
-                status, reporter, ct);
+                reporter.Log,
+                percent =>
+                {
+                    lock (statusLock)
+                    {
+                        if (currentStage == SteamStage.DownloadingUpdate && percent is { } up && selfUpdateBytes is { TotalBytes: > 0 } b)
+                        {
+                            EmitStatus(
+                                $"Обновление steamcmd ({Format.Size(b.DownloadedBytes)} из {Format.Size(b.TotalBytes)})",
+                                up);
+                            return;
+                        }
+
+                        // Ignore stdout percent once disk monitoring is actively reporting item download bytes,
+                        // unless steamcmd explicitly emits depot progress ("progress: XX.XX").
+                        if (diskBytesObserved && currentStage == SteamStage.DownloadingItem && percent is null)
+                            return;
+
+                        if (currentStage == SteamStage.Finishing && diskBytesObserved && expectedBytes.HasValue)
+                            return;
+
+                        EmitStatus(currentStatus, percent);
+                    }
+                },
+                stage =>
+                {
+                    lock (statusLock)
+                    {
+                        currentStage = stage;
+                        if (stage != SteamStage.DownloadingUpdate)
+                            selfUpdateBytes = null;
+
+                        currentStatus = stage switch
+                        {
+                            SteamStage.CheckingUpdates => "Проверка обновлений steamcmd…",
+                            SteamStage.DownloadingUpdate => "Загрузка обновления steamcmd…",
+                            SteamStage.ApplyingUpdate => "Установка обновления steamcmd…",
+                            SteamStage.VerifyingInstallation => "Проверка установки steamcmd…",
+                            SteamStage.LoadingApi => "Запуск Steam API…",
+                            SteamStage.Connecting => "Подключение к серверам Steam…",
+                            SteamStage.LoggingIn => "Авторизация в Steam…",
+                            SteamStage.DownloadingItem => expectedBytes is { } total
+                                ? $"Подготовка скачивания {label} ({Format.Size(total)})…"
+                                : $"Скачивание {label}…",
+                            SteamStage.Finishing => $"Завершение загрузки {label}…",
+                            _ => currentStatus,
+                        };
+
+                        if (!diskBytesObserved || stage != SteamStage.DownloadingItem)
+                            EmitStatus(currentStatus, stage == SteamStage.Finishing && diskBytesObserved && expectedBytes.HasValue ? 100 : null);
+                    }
+                },
+                bytes =>
+                {
+                    lock (statusLock)
+                        selfUpdateBytes = bytes;
+                },
+                monitorCt => MonitorDownloadBytesAsync(
+                    id,
+                    label,
+                    expectedBytes,
+                    () =>
+                    {
+                        lock (statusLock)
+                            return currentStage;
+                    },
+                    (text, pct) =>
+                    {
+                        lock (statusLock)
+                        {
+                            diskBytesObserved = true;
+                            currentStatus = text;
+                            if (currentStage is not SteamStage.Finishing)
+                                EmitStatus(text, pct);
+                        }
+                    },
+                    monitorCt),
+                ct);
 
             ThrowIfCannotStart(run);
 
             if (run.Download is { Success: true } ok)
             {
+                TryWritePrimedMarker();
+                reporter.Status($"Загрузка {label} завершена", 100);
+
                 // For single-file items steamcmd reports the file, not the folder.
                 var folder = ok.Path switch
                 {
@@ -157,7 +313,8 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
             var reason = run.Download?.Reason;
             if (attempt < DownloadAttempts && (reason is null || TransientReasons.Contains(reason)))
             {
-                reporter.Log("Сбой, повторяю через несколько секунд.");
+                reporter.Log("Сбой соединения со Steam, повтор через 3 секунды…");
+                reporter.Status($"Сбой соединения, повторная попытка ({attempt + 1} из {DownloadAttempts})…", null);
                 await Task.Delay(TimeSpan.FromSeconds(3), ct);
                 continue;
             }
@@ -168,18 +325,183 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
 
     public void WipeWorkshopCache()
     {
-        try
+        foreach (var cachePath in EnumerateCacheDirs())
         {
-            if (Directory.Exists(WorkshopCacheDir))
-                Directory.Delete(WorkshopCacheDir, recursive: true);
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            // A stale cache only costs disk space.
+            try
+            {
+                if (Directory.Exists(cachePath))
+                    Directory.Delete(cachePath, recursive: true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // A stale cache only costs disk space.
+            }
         }
     }
 
-    private async Task<SteamRun> RunAsync(IReadOnlyList<string> args, string status, Reporter reporter, CancellationToken ct)
+    // Measures the active workshop payload size on disk without double-counting across staging folders.
+    public long MeasureDownloadBytes(ulong itemId)
+    {
+        long maxBucket = 0;
+        foreach (var bucket in EnumerateDownloadBuckets(itemId))
+        {
+            var bucketBytes = SumDataFiles(bucket);
+            if (bucketBytes > maxBucket)
+                maxBucket = bucketBytes;
+        }
+
+        return maxBucket;
+    }
+
+    private IEnumerable<string> EnumerateCacheDirs()
+    {
+        yield return WorkshopCacheDir;
+        yield return Path.Combine(dir, "steamapps", "workshop");
+        yield return Path.Combine(dir, "userdata", "anonymous", "ugc");
+        yield return Path.Combine(homeDir, "Steam", "userdata", "anonymous", "ugc");
+        yield return Path.Combine(homeDir, ".steam", "steam", "userdata", "anonymous", "ugc");
+    }
+
+    private IEnumerable<string> EnumerateDownloadBuckets(ulong itemId)
+    {
+        yield return Path.Combine(homeDir, "Steam", "userdata", "anonymous", "ugc", "download");
+        yield return Path.Combine(homeDir, "Steam", "userdata", "anonymous", "ugc", "referenced");
+        yield return Path.Combine(homeDir, ".steam", "steam", "userdata", "anonymous", "ugc", "download");
+        yield return Path.Combine(homeDir, ".steam", "steam", "userdata", "anonymous", "ugc", "referenced");
+        yield return Path.Combine(dir, "userdata", "anonymous", "ugc", "download");
+        yield return Path.Combine(dir, "userdata", "anonymous", "ugc", "referenced");
+        yield return Path.Combine(WorkshopCacheDir, "downloads");
+        yield return Path.Combine(WorkshopCacheDir, "temp");
+        yield return ItemDir(itemId);
+    }
+
+    private static long SumDataFiles(string directory)
+    {
+        if (!Directory.Exists(directory))
+            return 0;
+
+        long total = 0;
+        try
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                var ext = Path.GetExtension(file);
+                if (MetadataExtensions.Contains(ext))
+                    continue;
+
+                try
+                {
+                    var len = new FileInfo(file).Length;
+                    if (len > 0)
+                        total += len;
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
+
+        return total;
+    }
+
+    private async Task MonitorDownloadBytesAsync(
+        ulong itemId,
+        string label,
+        long? expectedBytes,
+        Func<SteamStage> getStage,
+        Action<string, double?> onProgress,
+        CancellationToken ct)
+    {
+        long bestBytes = 0;
+        long lastReportedBytes = -1;
+        var samples = new Queue<(long TimestampTicks, long Bytes)>();
+        var sw = Stopwatch.StartNew();
+        var lastEmitTicks = 0L;
+
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                var stage = getStage();
+                if (stage is SteamStage.CheckingUpdates or SteamStage.DownloadingUpdate or SteamStage.ApplyingUpdate)
+                    continue;
+
+                var measured = MeasureDownloadBytes(itemId);
+                if (measured > bestBytes)
+                    bestBytes = measured;
+
+                if (bestBytes <= 0)
+                    continue;
+
+                var nowTicks = sw.ElapsedTicks;
+                samples.Enqueue((nowTicks, bestBytes));
+                var windowTicks = Stopwatch.Frequency * 2;
+                while (samples.Count > 2 && nowTicks - samples.Peek().TimestampTicks > windowTicks)
+                    samples.Dequeue();
+
+                double speed = 0;
+                if (samples.Count >= 2)
+                {
+                    var oldest = samples.Peek();
+                    var dt = (double)(nowTicks - oldest.TimestampTicks) / Stopwatch.Frequency;
+                    if (dt >= 0.25 && bestBytes > oldest.Bytes)
+                        speed = (bestBytes - oldest.Bytes) / dt;
+                }
+
+                // Update UI whenever bytes grew or every ~800ms to refresh the transfer rate smoothly.
+                if (bestBytes == lastReportedBytes && nowTicks - lastEmitTicks < Stopwatch.Frequency * 4 / 5)
+                    continue;
+
+                lastReportedBytes = bestBytes;
+                lastEmitTicks = nowTicks;
+
+                var speedText = speed > 0 ? $", {Format.Speed(speed)}" : "";
+                if (expectedBytes is > 0)
+                {
+                    var effectiveTotal = Math.Max(expectedBytes.Value, bestBytes);
+                    var pct = Math.Clamp(bestBytes * 100.0 / effectiveTotal, 0.5, 99.0);
+                    onProgress($"Скачивание {label}: {Format.Size(bestBytes)} из {Format.Size(effectiveTotal)}{speedText}", pct);
+                }
+                else
+                {
+                    onProgress($"Скачивание {label}: {Format.Size(bestBytes)}{speedText}…", null);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static string FormatItemLabel(ulong id, string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title))
+            return $"предмета {id}";
+
+        var clean = title.Trim();
+        if (clean.Length > MaxTitleDisplayLength)
+        {
+            var cut = MaxTitleDisplayLength - 1;
+            if (cut > 0 && char.IsHighSurrogate(clean[cut - 1]))
+                cut--;
+            clean = clean[..cut].TrimEnd() + "…";
+        }
+
+        return $"«{clean}»";
+    }
+
+    private async Task<SteamRun> RunCoreAsync(
+        IReadOnlyList<string> args,
+        Action<string> onLine,
+        Action<double?> onPercent,
+        Action<SteamStage>? onStage,
+        Action<SteamUpdateBytes>? onUpdateBytes,
+        Func<CancellationToken, Task>? monitorTaskFactory,
+        CancellationToken ct)
     {
         var startInfo = new ProcessStartInfo(ExePath)
         {
@@ -203,7 +525,7 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
             startInfo.Environment["HOME"] = homeDir;
         }
 
-        var output = new SteamOutput(reporter.Log, percent => reporter.Status(status, percent));
+        var output = new SteamOutput(onLine, onPercent, onStage, onUpdateBytes);
         using var process = new Process { StartInfo = startInfo };
 
         try
@@ -221,20 +543,43 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
         {
             var buffer = new char[4096];
             int read;
-            while ((read = await reader.ReadAsync(buffer.AsMemory())) > 0)
+            try
             {
-                var chunk = new string(buffer, 0, read);
-                lock (output)
-                    output.Feed(chunk);
+                while ((read = await reader.ReadAsync(buffer.AsMemory())) > 0)
+                {
+                    var chunk = new string(buffer, 0, read);
+                    lock (output)
+                        output.Feed(chunk);
+                }
+            }
+            catch (Exception e) when (e is IOException or ObjectDisposedException)
+            {
             }
         }
 
         var pumps = Task.WhenAll(Pump(process.StandardOutput), Pump(process.StandardError));
+        using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var monitorTask = monitorTaskFactory?.Invoke(monitorCts.Token) ?? Task.CompletedTask;
 
-        using (ct.Register(() => Kill(process)))
+        try
         {
-            await process.WaitForExitAsync(CancellationToken.None);
-            await Task.WhenAny(pumps, Task.Delay(TimeSpan.FromSeconds(3), CancellationToken.None));
+            using (ct.Register(() => Kill(process)))
+            {
+                await process.WaitForExitAsync(CancellationToken.None);
+                var drainTimeout = ct.IsCancellationRequested ? TimeSpan.FromMilliseconds(200) : TimeSpan.FromSeconds(2);
+                await Task.WhenAny(pumps, Task.Delay(drainTimeout, CancellationToken.None));
+            }
+        }
+        finally
+        {
+            await monitorCts.CancelAsync();
+            try
+            {
+                await monitorTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
         }
 
         lock (output)
@@ -242,6 +587,17 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
 
         ct.ThrowIfCancellationRequested();
         return new SteamRun(process.ExitCode, output.Download, output.Transcript);
+    }
+
+    private void TryWritePrimedMarker()
+    {
+        try
+        {
+            File.WriteAllText(PrimedMarker, "");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+        }
     }
 
     private static void Kill(Process process)
@@ -265,7 +621,10 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
             {
                 "File Not Found" => $"Предмет {id} не найден в Workshop: неверный ID, предмет удалён или скрыт.",
                 "Access Denied" => $"Нет доступа к предмету {id}: он скрыт или доступен только друзьям автора.",
-                "Timeout" or "No Connection" => "Нет связи со Steam. Проверьте интернет и повторите.",
+                "Invalid Parameter" => $"Предмет {id} не подходит для CS:GO (неверный тип предмета или другая игра).",
+                "Disk write failure" or "Not Enough Disk Space" => "Не удалось записать временные файлы steamcmd: проверьте свободное место на диске и права доступа.",
+                "No subscription" or "Locked" => $"Предмет {id} нельзя скачать анонимно через Steam Workshop ({reason}).",
+                "Timeout" or "No Connection" or "Service Unavailable" => "Нет связи со Steam. Проверьте интернет и повторите.",
                 _ => $"steamcmd не смог скачать предмет {id}: {reason}.",
             };
         }
@@ -313,13 +672,15 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
     private static async Task DownloadAsync(string[] urls, string destination, Reporter reporter, CancellationToken ct)
     {
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
-        http.DefaultRequestHeaders.UserAgent.ParseAdd("csgo-workshop/1.0");
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("csgo-workshop/1.2");
 
         Exception? last = null;
         foreach (var url in urls)
         {
             try
             {
+                reporter.Status("Загрузка steamcmd с серверов Valve…", null);
+
                 using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
                 response.EnsureSuccessStatusCode();
 
@@ -329,13 +690,29 @@ public sealed class SteamCmd(string dir, string homeDir, string contentDir)
 
                 var buffer = new byte[81920];
                 long done = 0;
+                var sw = Stopwatch.StartNew();
+                var lastReportMs = -100L;
                 int read;
                 while ((read = await source.ReadAsync(buffer, ct)) > 0)
                 {
                     await target.WriteAsync(buffer.AsMemory(0, read), ct);
                     done += read;
-                    if (total > 0)
-                        reporter.Status("Загрузка steamcmd…", done * 100.0 / total);
+
+                    var nowMs = sw.ElapsedMilliseconds;
+                    if (nowMs - lastReportMs >= 80 || (total > 0 && done >= total))
+                    {
+                        lastReportMs = nowMs;
+                        if (total > 0)
+                        {
+                            reporter.Status(
+                                $"Загрузка steamcmd: {Format.Size(done)} из {Format.Size(total)}",
+                                Math.Clamp(done * 100.0 / total, 0, 100));
+                        }
+                        else
+                        {
+                            reporter.Status($"Загрузка steamcmd: {Format.Size(done)}…", null);
+                        }
+                    }
                 }
 
                 return;

@@ -5,8 +5,11 @@ public static class AppPaths
     private const string WindowsName = "CsgoWorkshop";
     private const string UnixName = "csgo-workshop";
 
-    public static string ConfigDir { get; } = ResolveConfigDir();
-    public static string DataDir { get; } = ResolveDataDir();
+    private static readonly Lazy<string> LazyConfigDir = new(ResolveConfigDir);
+    private static readonly Lazy<string> LazyDataDir = new(ResolveDataDir);
+
+    public static string ConfigDir => LazyConfigDir.Value;
+    public static string DataDir => LazyDataDir.Value;
 
     public static string ConfigFile => Path.Combine(ConfigDir, "config.json");
     public static string InstalledFile => Path.Combine(ConfigDir, "installed.json");
@@ -35,16 +38,18 @@ public static class AppPaths
 
         // steamcmd.exe is a 32-bit program and misbehaves with non-ASCII install paths
         // (for example a Cyrillic user name), so prefer an ASCII-only location.
+        var systemRoot = Path.GetPathRoot(Environment.SystemDirectory) ?? @"C:\";
         var candidates = new[]
         {
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), WindowsName),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), WindowsName),
             Path.Combine(Environment.GetEnvironmentVariable("PUBLIC") ?? @"C:\Users\Public", WindowsName),
+            Path.Combine(systemRoot, "Temp", WindowsName),
         };
 
         foreach (var candidate in candidates)
         {
-            if (candidate.All(char.IsAscii) && CanWrite(candidate))
+            if (!string.IsNullOrWhiteSpace(candidate) && candidate.All(char.IsAscii) && CanWrite(candidate))
                 return candidate;
         }
 
@@ -61,7 +66,7 @@ public static class AppPaths
         try
         {
             Directory.CreateDirectory(dir);
-            var probe = Path.Combine(dir, ".write-test");
+            var probe = Path.Combine(dir, ".write-test-" + Guid.NewGuid().ToString("N")[..8]);
             File.WriteAllText(probe, "");
             File.Delete(probe);
             return true;

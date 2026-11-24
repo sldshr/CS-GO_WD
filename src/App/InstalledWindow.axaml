@@ -3,8 +3,8 @@
         xmlns:local="using:CsgoWorkshop.App"
         x:Class="CsgoWorkshop.App.InstalledWindow"
         Title="Скачанные карты"
-        Width="440" Height="320"
-        MinWidth="360" MinHeight="240"
+        Width="460" Height="340"
+        MinWidth="380" MinHeight="250"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
 
   <Grid Margin="10" RowSpacing="6" RowDefinitions="Auto,*,Auto,Auto">
@@ -30,9 +30,10 @@
 
     <TextBlock Grid.Row="2" x:Name="ResultText" IsVisible="False" TextWrapping="Wrap" />
 
-    <Grid Grid.Row="3" ColumnSpacing="6" ColumnDefinitions="Auto,*,Auto">
-      <Button x:Name="DeleteButton" IsEnabled="False" Content="Удалить" />
-      <Button Grid.Column="2" x:Name="CloseButton" IsCancel="True" Content="Закрыть" />
+    <Grid Grid.Row="3" ColumnSpacing="6" ColumnDefinitions="Auto,Auto,*,Auto">
+      <Button x:Name="CopyCommandButton" IsEnabled="False" Content="Копировать команду" />
+      <Button Grid.Column="1" x:Name="DeleteButton" IsEnabled="False" Content="Удалить" />
+      <Button Grid.Column="3" x:Name="CloseButton" IsCancel="True" Content="Закрыть" />
     </Grid>
   </Grid>
 </Window>

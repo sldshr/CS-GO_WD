@@ -34,7 +34,9 @@ public class MapExtractorTests
         var bsp = FakeBsp();
         WriteZip(Path.Combine(item, "123_legacy.bin"), ("aim_botz.bsp", bsp));
 
-        var result = MapExtractor.Extract(item, maps);
+        var percents = new List<double?>();
+        var reporter = new Reporter { Status = (_, p) => percents.Add(p) };
+        var result = MapExtractor.Extract(item, maps, reporter);
 
         var map = Assert.Single(result.Maps);
         Assert.Equal("aim_botz", map.Name);
@@ -44,6 +46,61 @@ public class MapExtractorTests
         Assert.Equal(bsp.Length, map.Size);
         Assert.Equal(0, result.SkippedEntries);
         Assert.Empty(Directory.GetFiles(maps, "*.part"));
+        Assert.Equal(100.0, percents[^1]);
+    }
+
+    [Fact]
+    public void IgnoresMacOsAppleDoubleMetadataEntries()
+    {
+        using var temp = new TempDir();
+        var item = temp.Sub("item");
+        var maps = temp.Sub("maps");
+        var bsp = FakeBsp();
+        WriteZip(
+            Path.Combine(item, "mac.bin"),
+            ("aim_botz.bsp", bsp),
+            ("__MACOSX/._aim_botz.bsp", [0, 5, 22, 7]),
+            ("._aim_botz.bsp", [0, 5, 22, 7]));
+
+        var result = MapExtractor.Extract(item, maps);
+
+        var map = Assert.Single(result.Maps);
+        Assert.Equal("aim_botz", map.Name);
+        Assert.Equal(0, result.SkippedEntries);
+    }
+
+    [Fact]
+    public void CleansUpPartFileWhenArchiveStreamIsCorrupted()
+    {
+        using var temp = new TempDir();
+        var item = temp.Sub("item");
+        var maps = temp.Sub("maps");
+        var binPath = Path.Combine(item, "corrupt.bin");
+        WriteZip(binPath, ("broken.bsp", FakeBsp(65536)));
+
+        // Corrupt compressed payload bytes near the middle of the ZIP file while keeping central directory intact.
+        var bytes = File.ReadAllBytes(binPath);
+        for (var i = 40; i < Math.Min(120, bytes.Length / 2); i++)
+            bytes[i] ^= 0xFF;
+        File.WriteAllBytes(binPath, bytes);
+
+        Assert.Throws<InstallException>(() => MapExtractor.Extract(item, maps));
+        Assert.Empty(Directory.GetFiles(maps));
+    }
+
+    [Fact]
+    public void RespectsCancellationToken()
+    {
+        using var temp = new TempDir();
+        var item = temp.Sub("item");
+        var maps = temp.Sub("maps");
+        WriteZip(Path.Combine(item, "1.bin"), ("aim_botz.bsp", FakeBsp()));
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        Assert.Throws<OperationCanceledException>(() => MapExtractor.Extract(item, maps, ct: cts.Token));
+        Assert.Empty(Directory.GetFiles(maps));
     }
 
     [Fact]

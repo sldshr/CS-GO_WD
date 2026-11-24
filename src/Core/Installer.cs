@@ -17,9 +17,21 @@ public sealed class Installer(SteamCmd steam, MapLibrary library)
         reporter.Log($"Предмет Workshop: {request.ItemId}");
         reporter.Log($"Папка maps: {request.MapsDir}");
 
+        reporter.Status($"Проверка предмета {request.ItemId} в Steam Workshop…", null);
+        var metadata = await WorkshopMetadata.TryFetchAsync(request.ItemId, ct);
+        WorkshopMetadata.ValidateForCsgo(metadata);
+
+        if (metadata is { Result: 1 })
+        {
+            if (!string.IsNullOrWhiteSpace(metadata.Title))
+                reporter.Log($"Название: {metadata.Title}");
+            if (metadata.FileSize is > 0)
+                reporter.Log($"Размер в Workshop: {Format.Size(metadata.FileSize.Value)}");
+        }
+
         await steam.EnsureInstalledAsync(reporter, ct);
         await steam.PrimeAsync(reporter, ct);
-        var itemDir = await steam.DownloadItemAsync(request.ItemId, reporter, ct);
+        var itemDir = await steam.DownloadItemAsync(request.ItemId, reporter, ct, metadata);
 
         ct.ThrowIfCancellationRequested();
         reporter.Status("Распаковка карты…", null);
@@ -27,7 +39,7 @@ public sealed class Installer(SteamCmd steam, MapLibrary library)
         ExtractResult extracted;
         try
         {
-            extracted = MapExtractor.Extract(itemDir, request.MapsDir);
+            extracted = MapExtractor.Extract(itemDir, request.MapsDir, reporter, ct);
         }
         finally
         {

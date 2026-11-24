@@ -15,6 +15,8 @@ public class WorkshopItemTests
     [InlineData("steamcommunity.com/sharedfiles/filedetails/?id=213240871#description", 213240871UL)]
     [InlineData("steam://url/CommunityFilePage/213240871", 213240871UL)]
     [InlineData("id=213240871", 213240871UL)]
+    [InlineData("workshop/243702660/aim_botz", 243702660UL)]
+    [InlineData("map workshop/243702660/aim_botz", 243702660UL)]
     public void Parses(string input, ulong expected)
     {
         Assert.True(WorkshopItem.TryParseId(input, out var id));

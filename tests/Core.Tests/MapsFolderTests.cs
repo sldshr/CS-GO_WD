@@ -17,8 +17,8 @@ public class MapsFolderTests
     {
         using var temp = new TempDir();
         var maps = temp.Sub("csgo legacy", "csgo", "maps");
-        var typed = "\"" + maps + System.IO.Path.DirectorySeparatorChar + "\"";
-        Assert.Equal(System.IO.Path.TrimEndingDirectorySeparator(maps), System.IO.Path.TrimEndingDirectorySeparator(MapsFolder.Resolve(typed)));
+        var typed = "\"" + maps + Path.DirectorySeparatorChar + "\"";
+        Assert.Equal(Path.TrimEndingDirectorySeparator(maps), Path.TrimEndingDirectorySeparator(MapsFolder.Resolve(typed)));
     }
 
     [Fact]
@@ -26,7 +26,7 @@ public class MapsFolderTests
     {
         using var temp = new TempDir();
         var maps = temp.Sub("csgo legacy", "csgo", "maps");
-        Assert.Equal(maps, MapsFolder.Resolve(System.IO.Path.GetDirectoryName(maps)));
+        Assert.Equal(maps, MapsFolder.Resolve(Path.GetDirectoryName(maps)));
     }
 
     [Fact]
@@ -35,6 +35,20 @@ public class MapsFolderTests
         using var temp = new TempDir();
         var maps = temp.Sub("csgo legacy", "csgo", "maps");
         Assert.Equal(maps, MapsFolder.Resolve(temp.Sub("csgo legacy")));
+    }
+
+    [Fact]
+    public void RejectsCs2MapsFolderAndSuggestsLegacyPath()
+    {
+        using var temp = new TempDir();
+        var cs2Csgo = temp.Sub("Counter-Strike Global Offensive", "game", "csgo");
+        var cs2Maps = temp.Sub("Counter-Strike Global Offensive", "game", "csgo", "maps");
+        var legacyMaps = temp.Sub("Counter-Strike Global Offensive", "csgo", "maps");
+        File.WriteAllText(Path.Combine(cs2Csgo, "gameinfo.gi"), "\"GameInfo\" {}");
+
+        var ex = Assert.Throws<InstallException>(() => MapsFolder.Resolve(cs2Maps));
+        Assert.Contains("CS2", ex.Message);
+        Assert.Contains(legacyMaps, ex.Message);
     }
 
     [Theory]
@@ -47,7 +61,7 @@ public class MapsFolderTests
     public void RejectsMissingFolder()
     {
         using var temp = new TempDir();
-        var ex = Assert.Throws<InstallException>(() => MapsFolder.Resolve(System.IO.Path.Combine(temp.Path, "nope", "maps")));
+        var ex = Assert.Throws<InstallException>(() => MapsFolder.Resolve(Path.Combine(temp.Path, "nope", "maps")));
         Assert.Contains("не найдена", ex.Message);
     }
 

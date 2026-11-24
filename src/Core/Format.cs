@@ -19,6 +19,31 @@ public static class Format
         };
     }
 
+    public static string Speed(double bytesPerSecond)
+    {
+        if (bytesPerSecond <= 0 || double.IsNaN(bytesPerSecond) || double.IsInfinity(bytesPerSecond))
+            return "";
+
+        const double kb = 1024;
+        const double mb = kb * 1024;
+
+        return bytesPerSecond switch
+        {
+            >= mb => Number(bytesPerSecond / mb) + " МБ/с",
+            >= kb => Math.Round(bytesPerSecond / kb).ToString(CultureInfo.InvariantCulture) + " КБ/с",
+            _ => Math.Max(1, Math.Round(bytesPerSecond)).ToString(CultureInfo.InvariantCulture) + " Б/с",
+        };
+    }
+
+    public static string Duration(TimeSpan elapsed)
+    {
+        if (elapsed < TimeSpan.Zero)
+            elapsed = TimeSpan.Zero;
+
+        var totalMinutes = (int)elapsed.TotalMinutes;
+        return $"{totalMinutes}:{elapsed.Seconds:00}";
+    }
+
     private static string Number(double value) =>
         value.ToString("0.0", CultureInfo.InvariantCulture).Replace('.', ',');
 }

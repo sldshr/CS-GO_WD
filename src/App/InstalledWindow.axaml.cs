@@ -1,6 +1,7 @@
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
+using Avalonia.Threading;
 using CsgoWorkshop.Core;
 
 namespace CsgoWorkshop.App;
@@ -30,6 +31,7 @@ public sealed class MapRow
     public long Size { get; }
     public string Details { get; }
     public IBrush DetailsBrush { get; }
+    public bool CanCopyCommand => !Missing && MapName.IsSafe(Name);
 }
 
 public partial class InstalledWindow : Window
@@ -41,6 +43,8 @@ public partial class InstalledWindow : Window
 
     private readonly MapLibrary _library;
 
+    public bool CopiedToClipboard { get; private set; }
+
     public InstalledWindow() : this(MapLibrary.Default())
     {
     }
@@ -50,25 +54,68 @@ public partial class InstalledWindow : Window
         _library = library;
         InitializeComponent();
 
-        MapList.SelectionChanged += (_, _) => DeleteButton.IsEnabled = MapList.SelectedItems?.Count > 0;
-        MapList.KeyDown += async (_, e) =>
-        {
-            if (e.Key != Key.Delete)
-                return;
-
-            e.Handled = true;
-            await DeleteSelectedAsync();
-        };
+        MapList.SelectionChanged += (_, _) => UpdateActionButtons();
+        MapList.KeyDown += OnListKeyDown;
+        CopyCommandButton.Click += async (_, _) => await CopySelectedCommandAsync();
         DeleteButton.Click += async (_, _) => await DeleteSelectedAsync();
         CloseButton.Click += (_, _) => Close();
         Opened += (_, _) =>
         {
             Activate();
-            var first = MapList.IsVisible ? MapList.ContainerFromIndex(0) : null;
-            (first ?? CloseButton).Focus();
+            Dispatcher.UIThread.Post(() =>
+            {
+                var first = MapList.IsVisible ? MapList.ContainerFromIndex(0) : null;
+                (first ?? CloseButton).Focus();
+            }, DispatcherPriority.Loaded);
         };
 
         Reload();
+    }
+
+    private void UpdateActionButtons()
+    {
+        var selected = MapList.SelectedItems?.OfType<MapRow>().ToList() ?? [];
+        DeleteButton.IsEnabled = selected.Count > 0;
+        CopyCommandButton.IsEnabled = selected is [{ CanCopyCommand: true }];
+    }
+
+    private async void OnListKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Delete)
+        {
+            e.Handled = true;
+            await DeleteSelectedAsync();
+        }
+        else if (e.Key == Key.C && e.KeyModifiers.HasFlag(KeyModifiers.Control))
+        {
+            e.Handled = true;
+            await CopySelectedCommandAsync();
+        }
+    }
+
+    private async Task CopySelectedCommandAsync()
+    {
+        if (MapList.SelectedItems?.OfType<MapRow>().ToList() is not [{ CanCopyCommand: true } row])
+            return;
+
+        var command = MapName.Command(row.Name);
+        try
+        {
+            if (Clipboard is not { } clipboard)
+                throw new InvalidOperationException("Буфер обмена недоступен");
+
+            await clipboard.SetTextAsync(command);
+            CopiedToClipboard = true;
+            ResultText.Text = $"Скопировано: {command}";
+            ResultText.Foreground = SuccessBrush;
+            ResultText.IsVisible = true;
+        }
+        catch (Exception)
+        {
+            ResultText.Text = $"Не удалось скопировать в буфер обмена. Команда: {command}";
+            ResultText.Foreground = ErrorBrush;
+            ResultText.IsVisible = true;
+        }
     }
 
     private void Reload()
@@ -84,7 +131,7 @@ public partial class InstalledWindow : Window
         EmptyText.IsVisible = rows.Count == 0;
         SummaryText.IsVisible = rows.Count > 0;
         SummaryText.Text = $"Установлено этой программой: {rows.Count}, занимают {Format.Size(rows.Where(r => !r.Missing).Sum(r => r.Size))}";
-        DeleteButton.IsEnabled = false;
+        UpdateActionButtons();
     }
 
     private async Task DeleteSelectedAsync()

@@ -2,7 +2,6 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Avalonia.Controls;
-using Avalonia.Input.Platform;
 using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
@@ -22,23 +21,51 @@ public partial class MainWindow : Window
 
     private readonly Settings _settings = Settings.Load();
     private readonly List<string> _log = [];
+    private readonly Stopwatch _elapsed = new();
+    private readonly DispatcherTimer _elapsedTimer;
+
     private CancellationTokenSource? _cts;
+    private int _activeRunId;
+    private double? _currentPercent;
     private bool _busy;
+    private bool _cancelling;
+    private bool _copiedToClipboard;
 
     public MainWindow()
     {
         InitializeComponent();
 
-        MapsBox.Text = !string.IsNullOrWhiteSpace(_settings.MapsDir) ? _settings.MapsDir : MapsFolder.Detect() ?? "";
+        MapsBox.Text = ResolveInitialMapsDir();
+
+        _elapsedTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(500), DispatcherPriority.Background, (_, _) =>
+        {
+            if (_busy)
+                UpdateProgressMeta();
+        });
 
         StartButton.Click += async (_, _) => await StartAsync();
-        CancelButton.Click += (_, _) => _cts?.Cancel();
+        CancelButton.Click += (_, _) => CancelCurrentRun();
+        PasteButton.Click += async (_, _) => await PasteItemAsync();
         BrowseButton.Click += async (_, _) => await BrowseAsync();
         CopyButton.Click += async (_, _) => await CopyCommandAsync();
         LibraryButton.Click += async (_, _) => await ShowInstalledAsync();
         AuthorLink.Click += (_, _) => OpenAuthorPage();
         Opened += (_, _) => ItemBox.Focus();
         Closing += OnClosing;
+    }
+
+    private string ResolveInitialMapsDir()
+    {
+        if (!string.IsNullOrWhiteSpace(_settings.MapsDir))
+        {
+            if (Directory.Exists(_settings.MapsDir))
+                return _settings.MapsDir;
+
+            var detected = MapsFolder.Detect();
+            return detected ?? _settings.MapsDir;
+        }
+
+        return MapsFolder.Detect() ?? "";
     }
 
     private async Task StartAsync()
@@ -51,6 +78,7 @@ public partial class MainWindow : Window
 
         if (!WorkshopItem.TryParseId(ItemBox.Text, out var id))
         {
+            ResetProgressBar(0);
             SetStatus("Не удалось определить ID. Вставьте ссылку на предмет Workshop или число из адреса (…?id=213240871).", Tone.Error);
             ItemBox.Focus();
             return;
@@ -63,6 +91,7 @@ public partial class MainWindow : Window
         }
         catch (InstallException e)
         {
+            ResetProgressBar(0);
             SetStatus(e.Message, Tone.Error);
             MapsBox.Focus();
             return;
@@ -74,14 +103,21 @@ public partial class MainWindow : Window
 
         _log.Clear();
         LogText.Text = "";
+
+        var runId = ++_activeRunId;
         SetBusy(true);
+        ShowProgress(runId, $"Подготовка загрузки предмета {id}…", null);
 
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
         var reporter = new Reporter
         {
-            Log = line => Dispatcher.UIThread.Post(() => AppendLog(line)),
-            Status = (text, percent) => Dispatcher.UIThread.Post(() => ShowProgress(text, percent)),
+            Log = line => Dispatcher.UIThread.Post(() =>
+            {
+                if (runId == _activeRunId)
+                    AppendLog(line);
+            }),
+            Status = (text, percent) => Dispatcher.UIThread.Post(() => ShowProgress(runId, text, percent)),
         };
 
         try
@@ -89,29 +125,49 @@ public partial class MainWindow : Window
             var request = new InstallRequest(id, mapsDir);
             var installer = new Installer(SteamCmd.Default(), MapLibrary.Default());
             var result = await Task.Run(() => installer.RunAsync(request, reporter, token));
+
+            SetBusy(false, finalProgress: 100);
             await ShowResultAsync(result);
         }
         catch (OperationCanceledException)
         {
+            SetBusy(false, finalProgress: 0);
             SetStatus("Отменено.", Tone.Normal);
             AppendLog("Отменено пользователем.");
         }
         catch (InstallException e)
         {
+            SetBusy(false, finalProgress: 0);
             SetStatus(e.Message, Tone.Error);
             AppendLog("Ошибка: " + e.Message);
         }
         catch (Exception e)
         {
+            SetBusy(false, finalProgress: 0);
             SetStatus("Непредвиденная ошибка: " + e.Message, Tone.Error);
             AppendLog(e.ToString());
         }
         finally
         {
-            _cts.Dispose();
+            _cts?.Dispose();
             _cts = null;
-            SetBusy(false);
+            if (_busy)
+                SetBusy(false, finalProgress: 0);
         }
+    }
+
+    private void CancelCurrentRun()
+    {
+        if (!_busy || _cancelling)
+            return;
+
+        _cancelling = true;
+        CancelButton.IsEnabled = false;
+        _currentPercent = null;
+        Progress.IsIndeterminate = true;
+        SetStatus("Отмена загрузки…", Tone.Normal);
+        UpdateProgressMeta();
+        _cts?.Cancel();
     }
 
     private async Task ShowResultAsync(InstallResult result)
@@ -139,32 +195,73 @@ public partial class MainWindow : Window
         SetDetail(string.Join('\n', details));
     }
 
-    private void SetBusy(bool busy)
+    private void SetBusy(bool busy, double finalProgress = 0)
     {
         _busy = busy;
+        _cancelling = false;
+
         StartButton.IsEnabled = !busy;
         CancelButton.IsEnabled = busy;
         ItemBox.IsEnabled = !busy;
+        PasteButton.IsEnabled = !busy;
         MapsBox.IsEnabled = !busy;
         BrowseButton.IsEnabled = !busy;
         LibraryButton.IsEnabled = !busy;
 
-        Progress.IsIndeterminate = busy;
-        if (!busy)
+        if (busy)
+        {
+            _currentPercent = null;
+            _elapsed.Restart();
+            _elapsedTimer.Start();
+            Progress.IsIndeterminate = true;
             Progress.Value = 0;
+            UpdateProgressMeta();
+        }
         else
-            SetStatus("", Tone.Normal);
+        {
+            _elapsedTimer.Stop();
+            _elapsed.Stop();
+            _currentPercent = null;
+            ProgressMetaText.IsVisible = false;
+            ResetProgressBar(finalProgress);
+        }
     }
 
-    private void ShowProgress(string text, double? percent)
+    private void ResetProgressBar(double value)
     {
-        if (!_busy)
+        Progress.IsIndeterminate = false;
+        Progress.Value = Math.Clamp(value, 0, 100);
+    }
+
+    private void ShowProgress(int runId, string text, double? percent)
+    {
+        if (!_busy || _cancelling || runId != _activeRunId)
             return;
 
-        SetStatus(percent is { } p ? $"{text} {p:0}%" : text, Tone.Normal);
-        Progress.IsIndeterminate = percent is null;
-        if (percent is { } value)
+        _currentPercent = percent is { } p ? Math.Clamp(p, 0, 100) : null;
+        SetStatus(text, Tone.Normal);
+
+        Progress.IsIndeterminate = _currentPercent is null;
+        if (_currentPercent is { } value)
             Progress.Value = value;
+
+        UpdateProgressMeta();
+    }
+
+    private void UpdateProgressMeta()
+    {
+        if (!_busy)
+        {
+            ProgressMetaText.IsVisible = false;
+            return;
+        }
+
+        var duration = Format.Duration(_elapsed.Elapsed);
+        ProgressMetaText.Text = _currentPercent is { } p
+            ? $"{p:0}% · {duration}"
+            : duration;
+        ProgressMetaText.IsVisible = true;
+        StatusRow.IsVisible = StatusText.Text is { Length: > 0 } || ProgressMetaText.IsVisible;
     }
 
     private void SetDetail(string text)
@@ -176,7 +273,7 @@ public partial class MainWindow : Window
     private void SetStatus(string text, Tone tone)
     {
         StatusText.Text = text;
-        StatusText.IsVisible = text.Length > 0;
+        StatusRow.IsVisible = text.Length > 0 || (_busy && ProgressMetaText.IsVisible);
         switch (tone)
         {
             case Tone.Success:
@@ -216,6 +313,7 @@ public partial class MainWindow : Window
     private void OnClosing(object? sender, WindowClosingEventArgs e)
     {
         _cts?.Cancel();
+        _elapsedTimer.Stop();
 
         try
         {
@@ -226,7 +324,8 @@ public partial class MainWindow : Window
         }
 
         SaveSettings();
-        FlushClipboard();
+        if (_copiedToClipboard)
+            FlushClipboard();
     }
 
     // Avalonia's clipboard data is a managed COM object; if it outlives the runtime, Windows crashes the process on exit.
@@ -235,8 +334,8 @@ public partial class MainWindow : Window
         if (!OperatingSystem.IsWindows())
             return;
 
-        for (var attempt = 0; attempt < 10 && OleFlushClipboard() != 0; attempt++)
-            Thread.Sleep(100);
+        for (var attempt = 0; attempt < 6 && OleFlushClipboard() != 0; attempt++)
+            Thread.Sleep(30);
     }
 
     [DllImport("ole32.dll")]
@@ -247,7 +346,10 @@ public partial class MainWindow : Window
         if (_busy)
             return;
 
-        await new InstalledWindow(MapLibrary.Default()).ShowDialog(this);
+        var dialog = new InstalledWindow(MapLibrary.Default());
+        await dialog.ShowDialog(this);
+        if (dialog.CopiedToClipboard)
+            _copiedToClipboard = true;
     }
 
     private void OpenAuthorPage()
@@ -262,6 +364,26 @@ public partial class MainWindow : Window
         catch (Exception e)
         {
             SetDetail($"Не удалось открыть браузер ({e.Message}). Адрес: {AuthorUrl}");
+        }
+    }
+
+    private async Task PasteItemAsync()
+    {
+        try
+        {
+            if (Clipboard is not { } clipboard)
+                return;
+
+            var text = await Avalonia.Input.Platform.ClipboardExtensions.TryGetTextAsync(clipboard);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                ItemBox.Text = text.Trim();
+                ItemBox.CaretIndex = ItemBox.Text.Length;
+                ItemBox.Focus();
+            }
+        }
+        catch (Exception)
+        {
         }
     }
 
@@ -284,6 +406,7 @@ public partial class MainWindow : Window
                 return false;
 
             await clipboard.SetTextAsync(text);
+            _copiedToClipboard = true;
             return true;
         }
         catch (Exception)
@@ -296,7 +419,9 @@ public partial class MainWindow : Window
     {
         try
         {
-            var path = await PickFolderAsync(MapsBox.Text?.Trim().Trim('"'));
+            var raw = MapsBox.Text?.Trim().Trim('"');
+            var expanded = !string.IsNullOrEmpty(raw) ? MapsFolder.ExpandHome(raw) : null;
+            var path = await PickFolderAsync(expanded);
             if (path is not null)
                 MapsBox.Text = path;
         }
@@ -322,7 +447,8 @@ public partial class MainWindow : Window
         if (!StorageProvider.CanPickFolder)
             throw new NotSupportedException("диалог выбора папки недоступен");
 
-        IStorageFolder? start = Directory.Exists(current) ? await StorageProvider.TryGetFolderFromPathAsync(current) : null;
+        var startPath = ResolveExistingParentDir(current);
+        IStorageFolder? start = startPath is not null ? await StorageProvider.TryGetFolderFromPathAsync(startPath) : null;
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
             Title = "Папка maps",
@@ -333,14 +459,29 @@ public partial class MainWindow : Window
         return folders.Count > 0 ? folders[0].TryGetLocalPath() : null;
     }
 
+    private static string? ResolveExistingParentDir(string? path)
+    {
+        var cursor = path;
+        while (!string.IsNullOrEmpty(cursor))
+        {
+            if (Directory.Exists(cursor))
+                return cursor;
+
+            cursor = Path.GetDirectoryName(cursor);
+        }
+
+        return null;
+    }
+
     // Avalonia's built-in GTK dialog shows an empty list when there is no xdg portal, so Linux tries zenity/kdialog first.
     private static async Task<string?> PickFolderWithExternalDialogAsync(string? current)
     {
-        var startDir = Directory.Exists(current) ? current : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var startDir = ResolveExistingParentDir(current)
+                       ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var title = IsUtf8Locale() ? "Папка maps" : "maps folder";
         var dialogs = new (string Exe, string[] Args)[]
         {
-            ("zenity", ["--file-selection", "--directory", $"--title={title}", $"--filename={startDir}/"]),
+            ("zenity", ["--file-selection", "--directory", $"--title={title}", $"--filename={startDir.TrimEnd('/')}/"]),
             ("kdialog", ["--getexistingdirectory", startDir, "--title", title]),
         };
 

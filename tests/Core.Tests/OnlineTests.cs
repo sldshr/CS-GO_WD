@@ -20,6 +20,7 @@ public sealed class SteamFixture : IDisposable
     public string Root { get; }
     public SteamCmd Steam { get; }
     public List<string> Log { get; } = [];
+    public List<(string Text, double? Percent)> Statuses { get; } = [];
 
     public SteamFixture()
     {
@@ -29,7 +30,7 @@ public sealed class SteamFixture : IDisposable
         Steam = new SteamCmd(Path.Combine(Root, "steamcmd"), Path.Combine(Root, "home"), Path.Combine(Root, "content"));
     }
 
-    public Reporter Reporter => new()
+    public Reporter CreateReporter(List<(string Text, double? Percent)>? statuses = null) => new()
     {
         Log = line =>
         {
@@ -40,7 +41,16 @@ public sealed class SteamFixture : IDisposable
                 File.AppendAllText(Path.Combine(Root, "it.log"), line + "\n");
             }
         },
-        Status = (_, _) => { },
+        Status = (text, pct) =>
+        {
+            lock (Statuses)
+            {
+                Statuses.Add((text, pct));
+                statuses?.Add((text, pct));
+                Directory.CreateDirectory(Root);
+                File.AppendAllText(Path.Combine(Root, "status.log"), $"{(pct is { } p ? $"{p:0.0}%" : "---")}\t{text}\n");
+            }
+        },
     };
 
     public void Dispose()
@@ -57,10 +67,11 @@ public class OnlineTests(SteamFixture fixture) : IClassFixture<SteamFixture>
     {
         using var temp = new TempDir();
         var maps = temp.Sub("csgo legacy", "csgo", "maps");
+        var statuses = new List<(string Text, double? Percent)>();
 
         var library = new MapLibrary(Path.Combine(temp.Path, "installed.json"));
         var request = new InstallRequest(243702660, MapsFolder.Resolve(maps));
-        var result = await new Installer(fixture.Steam, library).RunAsync(request, fixture.Reporter, CancellationToken.None);
+        var result = await new Installer(fixture.Steam, library).RunAsync(request, fixture.CreateReporter(statuses), CancellationToken.None);
 
         Assert.True(File.Exists(result.MapPath));
         Assert.Equal(Path.Combine(maps, result.MapName + ".bsp"), result.MapPath);
@@ -76,8 +87,14 @@ public class OnlineTests(SteamFixture fixture) : IClassFixture<SteamFixture>
             file.ReadExactly(header);
         Assert.Equal("VBSP", Encoding.ASCII.GetString(header));
 
+        // Verify all caches (including userdata/anonymous/ugc) are cleaned up!
         Assert.False(Directory.Exists(Path.Combine(fixture.Root, "content", "steamapps", "workshop")));
+        Assert.False(Directory.Exists(Path.Combine(fixture.Root, "home", "Steam", "userdata", "anonymous", "ugc")));
         Assert.Empty(Directory.GetFiles(maps, "*.part"));
+
+        // Verify progress actually reported intermediate/final percentages and never got stuck at 0% on update check!
+        Assert.Contains(statuses, s => s.Percent is > 0 and <= 100);
+        Assert.DoesNotContain(statuses, s => s.Percent == 0 && s.Text.Contains("steamcmd", StringComparison.OrdinalIgnoreCase));
     }
 
     [OnlineFact]
@@ -88,7 +105,7 @@ public class OnlineTests(SteamFixture fixture) : IClassFixture<SteamFixture>
 
         var library = new MapLibrary(Path.Combine(temp.Path, "installed.json"));
         var request = new InstallRequest(1, maps);
-        var ex = await Assert.ThrowsAsync<InstallException>(() => new Installer(fixture.Steam, library).RunAsync(request, fixture.Reporter, CancellationToken.None));
+        var ex = await Assert.ThrowsAsync<InstallException>(() => new Installer(fixture.Steam, library).RunAsync(request, fixture.CreateReporter(), CancellationToken.None));
 
         Assert.Contains("не найден", ex.Message);
         Assert.Empty(Directory.GetFiles(maps));
@@ -104,7 +121,7 @@ public class OnlineTests(SteamFixture fixture) : IClassFixture<SteamFixture>
 
         var library = new MapLibrary(Path.Combine(temp.Path, "installed.json"));
         var request = new InstallRequest(213240871, maps);
-        var task = new Installer(fixture.Steam, library).RunAsync(request, fixture.Reporter, cts.Token);
+        var task = new Installer(fixture.Steam, library).RunAsync(request, fixture.CreateReporter(), cts.Token);
         await Task.Delay(TimeSpan.FromSeconds(2));
         cts.Cancel();
 

@@ -2,8 +2,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="CsgoWorkshop.App.MainWindow"
         Title="CS:GO Workshop: загрузка карты"
-        Width="500" Height="380"
-        MinWidth="440" MinHeight="330"
+        Width="520" Height="400"
+        MinWidth="460" MinHeight="340"
         WindowStartupLocation="CenterScreen">
 
   <DockPanel Margin="10,8,10,6">
@@ -20,13 +20,16 @@
 
       <Grid Grid.Row="0" ColumnSpacing="6" RowSpacing="6" ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto">
         <TextBlock VerticalAlignment="Center" Text="Ссылка или ID" />
-        <TextBox Grid.Column="1" Grid.ColumnSpan="2" x:Name="ItemBox"
+        <TextBox Grid.Column="1" x:Name="ItemBox"
                  Watermark="…/sharedfiles/filedetails/?id=213240871" />
+        <Button Grid.Column="2" x:Name="PasteButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                Content="Вставить" />
 
         <TextBlock Grid.Row="1" VerticalAlignment="Center" Text="Папка maps" />
         <TextBox Grid.Row="1" Grid.Column="1" x:Name="MapsBox"
                  Watermark="…/steamapps/common/csgo legacy/csgo/maps" />
-        <Button Grid.Row="1" Grid.Column="2" x:Name="BrowseButton" Content="Обзор…" />
+        <Button Grid.Row="1" Grid.Column="2" x:Name="BrowseButton" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                Content="Обзор…" />
       </Grid>
 
       <Grid Grid.Row="1" Margin="0,2,0,0" ColumnSpacing="6" ColumnDefinitions="Auto,Auto,*,Auto">
@@ -35,10 +38,16 @@
         <Button Grid.Column="3" x:Name="LibraryButton" Content="Скачанные карты…" />
       </Grid>
 
-      <ProgressBar Grid.Row="2" x:Name="Progress" Height="4" MinHeight="4" Minimum="0" Maximum="100" Value="0" />
+      <ProgressBar Grid.Row="2" x:Name="Progress" Height="6" MinHeight="6" CornerRadius="3"
+                   Minimum="0" Maximum="100" Value="0" />
 
       <StackPanel Grid.Row="3" Spacing="4">
-        <TextBlock x:Name="StatusText" TextWrapping="Wrap" IsVisible="False" />
+        <Grid x:Name="StatusRow" IsVisible="False" ColumnSpacing="8" ColumnDefinitions="*,Auto">
+          <TextBlock x:Name="StatusText" TextWrapping="Wrap" VerticalAlignment="Center" />
+          <TextBlock Grid.Column="1" x:Name="ProgressMetaText" IsVisible="False"
+                     VerticalAlignment="Top" Foreground="#555555" FontWeight="SemiBold"
+                     FontFamily="Cascadia Mono,Consolas,DejaVu Sans Mono,Liberation Mono,monospace" />
+        </Grid>
         <TextBlock x:Name="DetailText" TextWrapping="Wrap" IsVisible="False" />
         <Grid x:Name="ResultPanel" IsVisible="False" ColumnSpacing="6" ColumnDefinitions="Auto,*,Auto">
           <TextBlock VerticalAlignment="Center" Text="Команда" />

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Compression;
 
 namespace CsgoWorkshop.Core;
@@ -11,7 +12,11 @@ public static class MapExtractor
     private const long MaxMapSize = 1536L * 1024 * 1024;
     private static readonly byte[] BspMagic = "VBSP"u8.ToArray();
 
-    public static ExtractResult Extract(string itemDir, string mapsDir)
+    public static ExtractResult Extract(
+        string itemDir,
+        string mapsDir,
+        Reporter? reporter = null,
+        CancellationToken ct = default)
     {
         if (!Directory.Exists(itemDir))
             throw new InstallException($"Папка предмета не найдена: {itemDir}");
@@ -28,18 +33,24 @@ public static class MapExtractor
 
         foreach (var file in files)
         {
+            ct.ThrowIfCancellationRequested();
+
             switch (System.IO.Path.GetExtension(file).ToLowerInvariant())
             {
                 case ".bsp":
                 {
+                    var baseName = System.IO.Path.GetFileName(file);
+                    if (IsAppleDoubleMetadata(file, baseName))
+                        break;
+
                     using var source = File.OpenRead(file);
                     var name = System.IO.Path.GetFileNameWithoutExtension(file);
-                    var map = Write(source, source.Length, name, mapsDir);
+                    var map = Write(source, source.Length, name, mapsDir, reporter, ct);
                     maps[map.Name] = map;
                     break;
                 }
                 case ".bin" or ".zip":
-                    skipped += ExtractArchive(file, mapsDir, maps);
+                    skipped += ExtractArchive(file, mapsDir, maps, reporter, ct);
                     break;
                 case ".vpk":
                     vpkOnly = true;
@@ -58,7 +69,12 @@ public static class MapExtractor
         throw new InstallException("В скачанном предмете нет файла карты (.bin с .bsp внутри или .bsp).");
     }
 
-    private static int ExtractArchive(string archivePath, string mapsDir, OrderedDictionary<string, ExtractedMap> maps)
+    private static int ExtractArchive(
+        string archivePath,
+        string mapsDir,
+        OrderedDictionary<string, ExtractedMap> maps,
+        Reporter? reporter,
+        CancellationToken ct)
     {
         ZipArchive archive;
         try
@@ -76,8 +92,10 @@ public static class MapExtractor
             var skipped = 0;
             foreach (var entry in archive.Entries)
             {
+                ct.ThrowIfCancellationRequested();
+
                 var baseName = BaseName(entry.FullName);
-                if (baseName.Length == 0)
+                if (baseName.Length == 0 || IsAppleDoubleMetadata(entry.FullName, baseName))
                     continue;
 
                 if (!baseName.EndsWith(".bsp", StringComparison.OrdinalIgnoreCase))
@@ -86,14 +104,34 @@ public static class MapExtractor
                     continue;
                 }
 
-                using var stream = entry.Open();
-                var map = Write(stream, entry.Length, baseName[..^4], mapsDir);
-                maps[map.Name] = map;
+                Stream stream;
+                try
+                {
+                    stream = entry.Open();
+                }
+                catch (InvalidDataException e)
+                {
+                    throw new InstallException(
+                        $"Архив предмета повреждён ({System.IO.Path.GetFileName(archivePath)}): {e.Message}");
+                }
+
+                using (stream)
+                {
+                    var map = Write(stream, entry.Length, baseName[..^4], mapsDir, reporter, ct);
+                    maps[map.Name] = map;
+                }
             }
 
             return skipped;
         }
     }
+
+    private static bool IsAppleDoubleMetadata(string fullName, string baseName) =>
+        baseName.StartsWith("._", StringComparison.Ordinal)
+        || fullName.StartsWith("__MACOSX/", StringComparison.OrdinalIgnoreCase)
+        || fullName.StartsWith("__MACOSX\\", StringComparison.OrdinalIgnoreCase)
+        || fullName.Contains("/__MACOSX/", StringComparison.OrdinalIgnoreCase)
+        || fullName.Contains("\\__MACOSX\\", StringComparison.OrdinalIgnoreCase);
 
     private static string BaseName(string entryName)
     {
@@ -101,37 +139,101 @@ public static class MapExtractor
         return slash >= 0 ? entryName[(slash + 1)..] : entryName;
     }
 
-    private static ExtractedMap Write(Stream source, long length, string name, string mapsDir)
+    private static ExtractedMap Write(
+        Stream source,
+        long declaredLength,
+        string name,
+        string mapsDir,
+        Reporter? reporter,
+        CancellationToken ct)
     {
         if (!MapName.IsSafe(name))
             throw new InstallException($"Недопустимое имя карты в архиве: \"{name}\".");
-        if (length > MaxMapSize)
-            throw new InstallException($"Файл карты слишком большой ({Format.Size(length)}).");
+        if (declaredLength > MaxMapSize)
+            throw new InstallException($"Файл карты слишком большой ({Format.Size(declaredLength)}).");
 
         var header = new byte[BspMagic.Length];
-        if (source.ReadAtLeast(header, header.Length, throwOnEndOfStream: false) < header.Length || !header.AsSpan().SequenceEqual(BspMagic))
+        int headerRead;
+        try
+        {
+            headerRead = source.ReadAtLeast(header, header.Length, throwOnEndOfStream: false);
+        }
+        catch (InvalidDataException e)
+        {
+            throw new InstallException($"Архив карты {name}.bsp повреждён: {e.Message}");
+        }
+
+        if (headerRead < header.Length || !header.AsSpan().SequenceEqual(BspMagic))
             throw new InstallException($"Файл {name}.bsp не похож на карту Source (нет заголовка VBSP).");
 
         var destination = System.IO.Path.Combine(mapsDir, name + ".bsp");
         var temp = destination + ".part";
         var replaced = File.Exists(destination);
 
+        reporter?.Status(
+            declaredLength > 0
+                ? $"Распаковка {name}.bsp ({Format.Size(declaredLength)})…"
+                : $"Распаковка {name}.bsp…",
+            declaredLength > 0 ? 0 : null);
+
+        var completed = false;
         try
         {
             using (var target = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
             {
                 target.Write(header);
-                source.CopyTo(target);
+                long written = header.Length;
+                var buffer = new byte[81920];
+                var sw = Stopwatch.StartNew();
+                var lastReportMs = -100L;
+                int read;
+
+                while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    written += read;
+                    if (written > MaxMapSize)
+                        throw new InstallException($"Файл карты слишком большой (превышен предел {Format.Size(MaxMapSize)}).");
+
+                    target.Write(buffer, 0, read);
+
+                    if (reporter is not null && sw.ElapsedMilliseconds - lastReportMs >= 80)
+                    {
+                        lastReportMs = sw.ElapsedMilliseconds;
+                        if (declaredLength > 0)
+                        {
+                            var effectiveTotal = Math.Max(declaredLength, written);
+                            reporter.Status(
+                                $"Распаковка {name}.bsp: {Format.Size(written)} из {Format.Size(effectiveTotal)}",
+                                Math.Clamp(written * 100.0 / effectiveTotal, 0, 100));
+                        }
+                        else
+                        {
+                            reporter.Status($"Распаковка {name}.bsp: {Format.Size(written)}…", null);
+                        }
+                    }
+                }
             }
 
+            ct.ThrowIfCancellationRequested();
             File.Move(temp, destination, overwrite: true);
+            completed = true;
+            reporter?.Status($"Распаковка {name}.bsp завершена", 100);
+        }
+        catch (InvalidDataException e)
+        {
+            throw new InstallException($"Архив карты {name}.bsp повреждён: {e.Message}");
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            TryDelete(temp);
             throw new InstallException(
                 $"Не удалось записать {destination}: {e.Message}\n" +
                 "Если карта сейчас загружена в игре, закройте игру или смените карту и повторите.");
+        }
+        finally
+        {
+            if (!completed)
+                TryDelete(temp);
         }
 
         return new ExtractedMap(name, destination, new FileInfo(destination).Length, replaced);
@@ -141,7 +243,8 @@ public static class MapExtractor
     {
         try
         {
-            File.Delete(path);
+            if (File.Exists(path))
+                File.Delete(path);
         }
         catch (Exception)
         {
